@@ -1,232 +1,477 @@
-// Copyright (c) 2019 Andy Pan
-// Copyright (c) 2018 Joshua J Baker
+// Copyright (c) 2023 The Gnet Authors. All rights reserved.
 //
-// Permission is hereby granted, free of charge, to any person obtaining a copy
-// of this software and associated documentation files (the "Software"), to deal
-// in the Software without restriction, including without limitation the rights
-// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-// copies of the Software, and to permit persons to whom the Software is
-// furnished to do so, subject to the following conditions:
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// The above copyright notice and this permission notice shall be included in all
-// copies or substantial portions of the Software.
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-// SOFTWARE.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package gnet
 
 import (
+	"errors"
+	"io"
 	"net"
+	"syscall"
+	"time"
 
-	"github.com/panjf2000/gnet/pool/bytebuffer"
-	prb "github.com/panjf2000/gnet/pool/ringbuffer"
-	"github.com/panjf2000/gnet/ringbuffer"
+	"golang.org/x/sys/windows"
+
+	"github.com/panjf2000/gnet/v2/pkg/buffer/elastic"
+	errorx "github.com/panjf2000/gnet/v2/pkg/errors"
+	bbPool "github.com/panjf2000/gnet/v2/pkg/pool/bytebuffer"
 )
 
-type stderr struct {
-	c   *stdConn
+type netErr struct {
+	c   *conn
 	err error
 }
 
-type wakeReq struct {
-	c *stdConn
-}
-
 type tcpConn struct {
-	c  *stdConn
-	bb *bytebuffer.ByteBuffer
+	c   *conn
+	buf *bbPool.ByteBuffer
 }
 
 type udpConn struct {
-	c *stdConn
+	c *conn
 }
 
-type stdConn struct {
-	ctx           interface{}            // user-defined context
-	conn          net.Conn               // original connection
-	loop          *eventloop             // owner event-loop
-	buffer        *bytebuffer.ByteBuffer // reuse memory of inbound data as a temporary buffer
-	codec         ICodec                 // codec for TCP
-	localAddr     net.Addr               // local server addr
-	remoteAddr    net.Addr               // remote peer addr
-	byteBuffer    *bytebuffer.ByteBuffer // bytes buffer for buffering current packet and data in ring-buffer
-	inboundBuffer *ringbuffer.RingBuffer // buffer for data from client
+type conn struct {
+	ctx           interface{}        // user-defined context
+	loop          *eventloop         // owner event-loop
+	buffer        *bbPool.ByteBuffer // reuse memory of inbound data as a temporary buffer
+	rawConn       net.Conn           // original connection
+	localAddr     net.Addr           // local server addr
+	remoteAddr    net.Addr           // remote peer addr
+	inboundBuffer elastic.RingBuffer // buffer for data from the peer
 }
 
-func packTCPConn(c *stdConn, buf []byte) *tcpConn {
-	packet := &tcpConn{c: c}
-	packet.bb = bytebuffer.Get()
-	_, _ = packet.bb.Write(buf)
-	return packet
+func packTCPConn(c *conn, buf []byte) *tcpConn {
+	tc := &tcpConn{c: c, buf: bbPool.Get()}
+	_, _ = tc.buf.Write(buf)
+	return tc
 }
 
-func packUDPConn(c *stdConn, buf []byte) *udpConn {
-	_, _ = c.buffer.Write(buf)
-	packet := &udpConn{c: c}
-	return packet
+func unpackTCPConn(tc *tcpConn) {
+	tc.c.buffer = tc.buf
+	tc.buf = nil
 }
 
-func newTCPConn(conn net.Conn, el *eventloop) (c *stdConn) {
-	c = &stdConn{
-		conn:          conn,
-		loop:          el,
-		codec:         el.svr.codec,
-		inboundBuffer: prb.Get(),
+func resetTCPConn(tc *tcpConn) {
+	bbPool.Put(tc.c.buffer)
+	tc.c.buffer = nil
+}
+
+func packUDPConn(c *conn, buf []byte) *udpConn {
+	uc := &udpConn{c}
+	_, _ = uc.c.buffer.Write(buf)
+	return uc
+}
+
+func newTCPConn(nc net.Conn, el *eventloop) (c *conn) {
+	c = &conn{
+		loop:    el,
+		rawConn: nc,
 	}
-	c.localAddr = el.svr.ln.lnaddr
-	c.remoteAddr = c.conn.RemoteAddr()
-	if el.svr.opts.TCPKeepAlive > 0 {
-		if tc, ok := conn.(*net.TCPConn); ok {
-			_ = tc.SetKeepAlive(true)
-			_ = tc.SetKeepAlivePeriod(el.svr.opts.TCPKeepAlive)
-		}
-	}
+	c.localAddr = c.rawConn.LocalAddr()
+	c.remoteAddr = c.rawConn.RemoteAddr()
 	return
 }
 
-func (c *stdConn) releaseTCP() {
+func (c *conn) release() {
 	c.ctx = nil
 	c.localAddr = nil
-	c.remoteAddr = nil
-	c.conn = nil
-	prb.Put(c.inboundBuffer)
-	c.inboundBuffer = nil
-	bytebuffer.Put(c.buffer)
+	if c.rawConn != nil {
+		c.rawConn = nil
+		c.remoteAddr = nil
+	}
+	c.inboundBuffer.Done()
+	bbPool.Put(c.buffer)
 	c.buffer = nil
 }
 
-func newUDPConn(el *eventloop, localAddr, remoteAddr net.Addr) *stdConn {
-	return &stdConn{
+func newUDPConn(el *eventloop, localAddr, remoteAddr net.Addr) *conn {
+	return &conn{
 		loop:       el,
-		buffer:     bytebuffer.Get(),
+		buffer:     bbPool.Get(),
 		localAddr:  localAddr,
 		remoteAddr: remoteAddr,
 	}
 }
 
-func (c *stdConn) releaseUDP() {
-	c.ctx = nil
-	c.localAddr = nil
-	bytebuffer.Put(c.buffer)
-	c.buffer = nil
-}
-
-func (c *stdConn) read() ([]byte, error) {
-	return c.codec.Decode(c)
-}
-
-// ================================= Public APIs of gnet.Conn =================================
-
-func (c *stdConn) Read() []byte {
-	if c.inboundBuffer.IsEmpty() {
-		return c.buffer.Bytes()
-	}
-	c.byteBuffer = c.inboundBuffer.WithByteBuffer(c.buffer.Bytes())
-	return c.byteBuffer.Bytes()
-}
-
-func (c *stdConn) ResetBuffer() {
+func (c *conn) resetBuffer() {
 	c.buffer.Reset()
 	c.inboundBuffer.Reset()
-	bytebuffer.Put(c.byteBuffer)
-	c.byteBuffer = nil
 }
 
-func (c *stdConn) ReadN(n int) (size int, buf []byte) {
-	inBufferLen := c.inboundBuffer.Length()
-	tempBufferLen := c.buffer.Len()
-	if totalLen := inBufferLen + tempBufferLen; totalLen < n || n <= 0 {
-		n = totalLen
-	}
-	size = n
+func (c *conn) Read(p []byte) (n int, err error) {
 	if c.inboundBuffer.IsEmpty() {
-		buf = c.buffer.B[:n]
+		n = copy(p, c.buffer.B)
+		c.buffer.B = c.buffer.B[n:]
+		if n == 0 && len(p) > 0 {
+			err = io.EOF
+		}
 		return
 	}
-	head, tail := c.inboundBuffer.LazyRead(n)
-	c.byteBuffer = bytebuffer.Get()
-	_, _ = c.byteBuffer.Write(head)
-	_, _ = c.byteBuffer.Write(tail)
-	if inBufferLen >= n {
-		buf = c.byteBuffer.Bytes()
+	n, _ = c.inboundBuffer.Read(p)
+	if n == len(p) {
 		return
 	}
-
-	restSize := n - inBufferLen
-	_, _ = c.byteBuffer.Write(c.buffer.B[:restSize])
-	buf = c.byteBuffer.Bytes()
+	m := copy(p[n:], c.buffer.B)
+	n += m
+	c.buffer.B = c.buffer.B[m:]
 	return
 }
 
-func (c *stdConn) ShiftN(n int) (size int) {
-	inBufferLen := c.inboundBuffer.Length()
-	tempBufferLen := c.buffer.Len()
-	if inBufferLen+tempBufferLen < n || n <= 0 {
-		c.ResetBuffer()
-		size = inBufferLen + tempBufferLen
-		return
+func (c *conn) Next(n int) (buf []byte, err error) {
+	inBufferLen := c.inboundBuffer.Buffered()
+	if totalLen := inBufferLen + c.buffer.Len(); n > totalLen {
+		return nil, io.ErrShortBuffer
+	} else if n <= 0 {
+		n = totalLen
 	}
-	size = n
 	if c.inboundBuffer.IsEmpty() {
+		buf = c.buffer.B[:n]
 		c.buffer.B = c.buffer.B[n:]
 		return
 	}
-
-	bytebuffer.Put(c.byteBuffer)
-	c.byteBuffer = nil
-
-	if inBufferLen >= n {
-		c.inboundBuffer.Shift(n)
-		return
+	head, tail := c.inboundBuffer.Peek(n)
+	defer c.inboundBuffer.Discard(n) //nolint:errcheck
+	if len(head) >= n {
+		return head[:n], err
 	}
-	c.inboundBuffer.Reset()
+	c.loop.cache.Reset()
+	c.loop.cache.Write(head)
+	c.loop.cache.Write(tail)
+	if inBufferLen >= n {
+		return c.loop.cache.Bytes(), err
+	}
 
-	restSize := n - inBufferLen
-	c.buffer.B = c.buffer.B[restSize:]
-	return
+	remaining := n - inBufferLen
+	c.loop.cache.Write(c.buffer.B[:remaining])
+	c.buffer.B = c.buffer.B[remaining:]
+	return c.loop.cache.Bytes(), err
 }
 
-func (c *stdConn) BufferLength() int {
-	return c.inboundBuffer.Length() + c.buffer.Len()
+func (c *conn) Peek(n int) (buf []byte, err error) {
+	inBufferLen := c.inboundBuffer.Buffered()
+	if totalLen := inBufferLen + c.buffer.Len(); n > totalLen {
+		return nil, io.ErrShortBuffer
+	} else if n <= 0 {
+		n = totalLen
+	}
+	if c.inboundBuffer.IsEmpty() {
+		return c.buffer.B[:n], err
+	}
+	head, tail := c.inboundBuffer.Peek(n)
+	if len(head) >= n {
+		return head[:n], err
+	}
+	c.loop.cache.Reset()
+	c.loop.cache.Write(head)
+	c.loop.cache.Write(tail)
+	if inBufferLen >= n {
+		return c.loop.cache.Bytes(), err
+	}
+
+	remaining := n - inBufferLen
+	c.loop.cache.Write(c.buffer.B[:remaining])
+	return c.loop.cache.Bytes(), err
 }
 
-func (c *stdConn) AsyncWrite(buf []byte) (err error) {
-	var encodedBuf []byte
-	if encodedBuf, err = c.codec.Encode(c, buf); err == nil {
-		c.loop.ch <- func() (err error) {
-			if c.conn != nil {
-				_, err = c.conn.Write(encodedBuf)
-			}
+func (c *conn) Discard(n int) (int, error) {
+	inBufferLen := c.inboundBuffer.Buffered()
+	tempBufferLen := c.buffer.Len()
+	if inBufferLen+tempBufferLen < n || n <= 0 {
+		c.resetBuffer()
+		return inBufferLen + tempBufferLen, nil
+	}
+	if c.inboundBuffer.IsEmpty() {
+		c.buffer.B = c.buffer.B[n:]
+		return n, nil
+	}
+
+	discarded, _ := c.inboundBuffer.Discard(n)
+	if discarded < inBufferLen {
+		return discarded, nil
+	}
+
+	remaining := n - inBufferLen
+	c.buffer.B = c.buffer.B[remaining:]
+	return n, nil
+}
+
+func (c *conn) Write(p []byte) (int, error) {
+	if c.rawConn == nil && c.loop.eng.ln.pc == nil {
+		return 0, net.ErrClosed
+	}
+	if c.rawConn != nil {
+		return c.rawConn.Write(p)
+	}
+	return c.loop.eng.ln.pc.WriteTo(p, c.remoteAddr)
+}
+
+func (c *conn) Writev(bs [][]byte) (int, error) {
+	if c.rawConn != nil {
+		bb := bbPool.Get()
+		defer bbPool.Put(bb)
+		for i := range bs {
+			_, _ = bb.Write(bs[i])
+		}
+		return c.rawConn.Write(bb.Bytes())
+	}
+	return 0, net.ErrClosed
+}
+
+func (c *conn) ReadFrom(r io.Reader) (int64, error) {
+	if c.rawConn != nil {
+		return io.Copy(c.rawConn, r)
+	}
+	return 0, net.ErrClosed
+}
+
+func (c *conn) WriteTo(w io.Writer) (n int64, err error) {
+	if !c.inboundBuffer.IsEmpty() {
+		if n, err = c.inboundBuffer.WriteTo(w); err != nil {
 			return
 		}
 	}
-	return
+	defer c.buffer.Reset()
+	return c.buffer.WriteTo(w)
 }
 
-func (c *stdConn) SendTo(buf []byte) (err error) {
-	_, err = c.loop.svr.ln.pconn.WriteTo(buf, c.remoteAddr)
-	return
-}
-
-func (c *stdConn) Wake() error {
-	c.loop.ch <- wakeReq{c}
+func (c *conn) Flush() error {
 	return nil
 }
 
-func (c *stdConn) Close() error {
+func (c *conn) InboundBuffered() int {
+	return c.inboundBuffer.Buffered() + c.buffer.Len()
+}
+
+func (c *conn) OutboundBuffered() int {
+	return 0
+}
+
+func (c *conn) Context() interface{}       { return c.ctx }
+func (c *conn) SetContext(ctx interface{}) { c.ctx = ctx }
+func (c *conn) LocalAddr() net.Addr        { return c.localAddr }
+func (c *conn) RemoteAddr() net.Addr       { return c.remoteAddr }
+
+func (c *conn) Fd() (fd int) {
+	if c.rawConn == nil {
+		return -1
+	}
+
+	rc, err := c.rawConn.(syscall.Conn).SyscallConn()
+	if err != nil {
+		return -1
+	}
+	if err := rc.Control(func(i uintptr) {
+		fd = int(i)
+	}); err != nil {
+		return -1
+	}
+	return
+}
+
+func (c *conn) Dup() (fd int, err error) {
+	if c.rawConn == nil && c.loop.eng.ln.pc == nil {
+		return -1, net.ErrClosed
+	}
+
+	var (
+		sc syscall.Conn
+		ok bool
+	)
+	if c.rawConn != nil {
+		sc, ok = c.rawConn.(syscall.Conn)
+	} else {
+		sc, ok = c.loop.eng.ln.pc.(syscall.Conn)
+	}
+
+	if !ok {
+		return -1, errors.New("failed to convert net.Conn to syscall.Conn")
+	}
+	rc, err := sc.SyscallConn()
+	if err != nil {
+		return -1, errors.New("failed to get syscall.RawConn from net.Conn")
+	}
+
+	var dupHandle windows.Handle
+	e := rc.Control(func(fd uintptr) {
+		process := windows.CurrentProcess()
+		err = windows.DuplicateHandle(
+			process,
+			windows.Handle(fd),
+			process,
+			&dupHandle,
+			0,
+			true,
+			windows.DUPLICATE_SAME_ACCESS,
+		)
+	})
+	if err != nil {
+		return -1, err
+	}
+	if e != nil {
+		return -1, e
+	}
+
+	return int(dupHandle), nil
+}
+
+func (c *conn) SetReadBuffer(bytes int) error {
+	if c.rawConn == nil && c.loop.eng.ln.pc == nil {
+		return net.ErrClosed
+	}
+
+	if c.rawConn != nil {
+		return c.rawConn.(interface{ SetReadBuffer(int) error }).SetReadBuffer(bytes)
+	}
+	return c.loop.eng.ln.pc.(interface{ SetReadBuffer(int) error }).SetReadBuffer(bytes)
+}
+
+func (c *conn) SetWriteBuffer(bytes int) error {
+	if c.rawConn == nil && c.loop.eng.ln.pc == nil {
+		return net.ErrClosed
+	}
+	if c.rawConn != nil {
+		return c.rawConn.(interface{ SetWriteBuffer(int) error }).SetWriteBuffer(bytes)
+	}
+	return c.loop.eng.ln.pc.(interface{ SetWriteBuffer(int) error }).SetWriteBuffer(bytes)
+}
+
+func (c *conn) SetLinger(sec int) error {
+	if c.rawConn == nil {
+		return net.ErrClosed
+	}
+
+	tc, ok := c.rawConn.(*net.TCPConn)
+	if !ok {
+		return errorx.ErrUnsupportedOp
+	}
+	return tc.SetLinger(sec)
+}
+
+func (c *conn) SetNoDelay(noDelay bool) error {
+	if c.rawConn == nil {
+		return net.ErrClosed
+	}
+
+	tc, ok := c.rawConn.(*net.TCPConn)
+	if !ok {
+		return errorx.ErrUnsupportedOp
+	}
+	return tc.SetNoDelay(noDelay)
+}
+
+func (c *conn) SetKeepAlivePeriod(d time.Duration) error {
+	if c.rawConn == nil {
+		return net.ErrClosed
+	}
+
+	tc, ok := c.rawConn.(*net.TCPConn)
+	if !ok || d < 0 {
+		return errorx.ErrUnsupportedOp
+	}
+	if err := tc.SetKeepAlive(true); err != nil {
+		return err
+	}
+	if err := tc.SetKeepAlivePeriod(d); err != nil {
+		_ = tc.SetKeepAlive(false)
+		return err
+	}
+
+	return nil
+}
+
+// Gfd return an uninitialized GFD which is not valid,
+// this method is only implemented for compatibility, don't use it on Windows.
+// func (c *conn) Gfd() gfd.GFD { return gfd.GFD{} }
+
+func (c *conn) AsyncWrite(buf []byte, cb AsyncCallback) error {
+	if cb == nil {
+		cb = func(c Conn, err error) error { return nil }
+	}
+	_, err := c.Write(buf)
 	c.loop.ch <- func() error {
-		return c.loop.loopCloseConn(c)
+		return cb(c, err)
 	}
 	return nil
 }
 
-func (c *stdConn) Context() interface{}       { return c.ctx }
-func (c *stdConn) SetContext(ctx interface{}) { c.ctx = ctx }
-func (c *stdConn) LocalAddr() net.Addr        { return c.localAddr }
-func (c *stdConn) RemoteAddr() net.Addr       { return c.remoteAddr }
+func (c *conn) AsyncWritev(bs [][]byte, cb AsyncCallback) error {
+	buf := bbPool.Get()
+	for _, b := range bs {
+		_, _ = buf.Write(b)
+	}
+	return c.AsyncWrite(buf.Bytes(), func(c Conn, err error) error {
+		defer bbPool.Put(buf)
+		if cb == nil {
+			return err
+		}
+		return cb(c, err)
+	})
+}
+
+func (c *conn) Wake(cb AsyncCallback) error {
+	if cb == nil {
+		cb = func(c Conn, err error) error { return nil }
+	}
+	c.loop.ch <- func() (err error) {
+		defer func() {
+			defer func() {
+				if err == nil {
+					err = cb(c, nil)
+					return
+				}
+				_ = cb(c, err)
+			}()
+		}()
+		return c.loop.wake(c)
+	}
+	return nil
+}
+
+func (c *conn) Close() error {
+	c.loop.ch <- func() error {
+		err := c.loop.close(c, nil)
+		return err
+	}
+	return nil
+}
+
+func (c *conn) CloseWithCallback(cb AsyncCallback) error {
+	if cb == nil {
+		cb = func(c Conn, err error) error { return nil }
+	}
+	c.loop.ch <- func() (err error) {
+		defer func() {
+			if err == nil {
+				err = cb(c, nil)
+				return
+			}
+			_ = cb(c, err)
+		}()
+		return c.loop.close(c, nil)
+	}
+	return nil
+}
+
+func (*conn) SetDeadline(_ time.Time) error {
+	return errorx.ErrUnsupportedOp
+}
+
+func (*conn) SetReadDeadline(_ time.Time) error {
+	return errorx.ErrUnsupportedOp
+}
+
+func (*conn) SetWriteDeadline(_ time.Time) error {
+	return errorx.ErrUnsupportedOp
+}
